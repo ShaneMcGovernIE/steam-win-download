@@ -1,50 +1,106 @@
-Steam AppManifest generator
+Steam-Win-Download
+(Forked from steam-appmanifest by pinkwah)
 ===========================
 
-This is a short python script that tricks Steam for Linux into downloading non-Linux apps.
+This script connects to your public Steam profile, retrieves a list of your owned games, and helps you generate the corresponding Windows appmanifest files for the select games used by Steam. Once downloaded, the Windows version of the select games will appear in your Steam download queue.
 
-Note: Steam will not run apps that don't have Linux support, but it will still download the data.
+# Key Features:
 
-## How it works
+- **Refresh & Retrieve Games:** Enter your Steam Community ID, click "Refresh," and the script fetches all your owned games via the Steam Community XML API.
+- **Toggleable Game List:** Each game appears in a list with a toggle. Check the boxes beside the games you want to generate manifests for.
+- **Search Functionality:** Easily find games by typing a partial name in the search box. The list filters in real time.
+- **Selective Manifest Creation:** Click "Download" to create the `.acf` files only for the toggled (selected) games.
+- **Flexible & Resizable GUI:** The window layout can be resized to suit your preference.
 
-When you tell Steam to download an app, it first checks whether a Linux version exists. If it doesn't exist, it tells you so ("[App] is not available on your current platform.") and doesn't do anything. If it exists, it creates an `appmanifest` file (which contains game meta-data: name, size on hard-disk, time of last update, etc), and then proceeds to download it.
+With this tool, you can quickly populate your Steam library folder with the appropriate manifest files, helping you manage your Steam installations more efficiently.  
 
-I found that if the `appmanifest` file is created manually, Steam will still download the app regardless of platform. There are a minimum of three variables that have to be set in order for this to work. The first is the `AppID` -- the ID of the app you're trying to download. The second is the `Universe`. [Refer to the Valve Developer Wiki for more info.](https://developer.valvesoftware.com/wiki/SteamID#Universes_Available_for_Steam_Accounts) The last and the most magical one is the `StateFlags`. Setting this to `1026` tells Steam that an update is required and that the update has been started previously. More info on `StateFlags` can be found [here](https://github.com/lutris/lutris/blob/master/docs/steam.rst). (Thanks to strycore for pointing this out.)
 
-## Using the script
+# Changelog
 
-You need Python 3 and Python 3 GObject Bindings for the script to run.
+Below is a list of all major changes made from the **original script** to the **new updated version**. The changes are grouped by category for clarity.
 
-* Debian and Ubuntu (and derivatives) don't have these installed by default. The packages are `python3` and `python3-gi`.
-* ArchLinux and derivatives can install `python` and `python-gobject`.
-* Fedora should have everything installed by default.
-* Mac OS requires python3 bindings for GTK3, which can be installed with `brew install pygobject3 --with-python3`.
+---
 
-After you have installed these, [download `steam-appmanifest.py`.](https://raw.github.com/dotfloat/steam-appmanifest/master/steam-appmanifest.py) Make the file executable (`$ chmod +x steam-appmanifest.py`) and start it. A dialog should appear. Type in your Steam Community ID in the top textbox and hit `Refresh`. Make sure your profile is publicly viewable. A list of titles should appear. Install the apps that you want by clicking the checkbox to the left of the Title (and AppID). After you finish, restart Steam.
+## 1. GTK and Python Compatibility
 
-## Manual
+- **GTK Version Import**  
+  - Added `import gi` and `gi.require_version('Gtk', '3.0')` before importing `Gtk` in the newer scripts, ensuring explicit targeting of GTK 3.
 
-I created the python script for ease of use. However, it is also possible to create the `appmanifest` files manually, without the script.
+- **Replacement of Deprecated Methods**  
+  - Replaced `tree.getiterator('game')` (deprecated) with `tree.iter('game')`.
+  - Converted positional GObject constructor calls to keyword-based arguments (e.g., `Gtk.Label(label="...")` instead of `Gtk.Label("...")`).
 
-1. Find the `AppID` of the app you're trying to download. This can be easily done by going on [SteamDB](http://steamdb.info) and searching for it.
-2. Go to `~/.steam/steam/SteamApps` or wherever your main SteamApps folder is.
-3. Create and open a new file called "`appmanifest_APPID.acf`", replace `APPID` with the actual AppID you found in Step 1.
-4. Copy and paste the following and replace `APPID` (the all-caps one) with the one you found in Step 1 and `APPNAME` with the folder name to download to:
+---
 
-```
-    "AppState"
-    {
-      "AppID"  "APPID"
-      "Universe" "1"
-      "installdir" "APPNAME"
-      "StateFlags" "1026"
-    }
-```
+## 2. Overall GUI and Layout Rework
 
-Save and restart Steam.
+- **Freely Resizable Window**  
+  - Removed or changed `set_resizable(False)` and used `self.set_resizable(True)`.  
+  - Set a default size with `self.set_default_size(600, 400)` for convenience.
 
-## Disclaimer
+- **Box and Layout Changes**  
+  - Replaced the single `Gtk.Box` approach with a structured layout, using multiple boxes and a main vertical container (`Gtk.Box(orientation=Gtk.Orientation.VERTICAL, ...)`).
 
-This method isn't guaranteed to work. I've tested it on several games and they all seemed to download fine except for Civilization V, which just made an empty directory.
+- **Scrolling Support**  
+  - Wrapped the game list in a `Gtk.ScrolledWindow` to better handle long lists.
 
-Steam won't download apps you don't own.
+---
+
+## 3. Toggleable Game List & Manifest Generation
+
+- **New Tree Model**  
+  - Added a `Gtk.ListStore(bool, str, str)` or similar to store `(toggled, app_id, game_name)`.
+  - Used `Gtk.TreeView` with a `Gtk.CellRendererToggle` column to select which games should have manifest files generated.
+
+- **Manifest Creation Button**  
+  - Transitioned from a row-by-row approach (`appmanifest` creation/removal) to a single **Download** button that processes all toggled items at once.
+
+- **Selective Manifests**  
+  - Only toggled (checked) games generate `.acf` files when “Download” is clicked.
+
+---
+
+## 4. Search Functionality
+
+- **Search Box**  
+  - Added a new search field (`Gtk.Entry`) for filtering game names in real time.
+
+- **Filtered Model**  
+  - Implemented a filter model (`Gtk.TreeModelFilter`) with a `visible_func` to dynamically show/hide rows based on the user’s search text.
+
+- **Real-Time Filtering**  
+  - Whenever the user types in the search field, the model is refiltered to only display matching games (case-insensitive).
+
+---
+
+## 5. Additional Improvements and Enhancements
+
+- **Profile Fetch**  
+  - Switched from `urllib.request` to **`requests`** with a timeout and clearer exception handling.
+
+- **Path Detection**  
+  - Implemented a cross-platform check for the default Steam library path, varying by OS (Windows, macOS, Linux).
+
+- **Manual vs. Automated**  
+  - Kept a “Manual” button or function but relied primarily on the toggleable list for automatic manifest creation.
+
+- **Message Dialogs**  
+  - Used `Gtk.MessageDialog` for error/info messages (e.g., timeouts, invalid Steam path).
+
+- **UK English and Comma Usage**  
+  - Adjusted user-facing text to conform to UK spelling, replacing textual hyphens with commas.
+
+---
+
+## 6. Code Structure and Readability
+
+- **Refactored into a Single Class**  
+  - Merged separate dialog classes (`DlgToggleApp`, `DlgManual`) into a single-window UI or consolidated logic.
+
+- **Function Splitting**  
+  - Defined dedicated functions: `on_refresh_click`, `on_download_click`, `on_search_changed`, `on_toggle_toggled` for modular code.
+
+- **Comments and Documentation**  
+  - Updated docstrings and inline comments to reflect the new UI layout and flow.
+
+---

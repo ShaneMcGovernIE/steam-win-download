@@ -1,239 +1,267 @@
 #!/usr/bin/env python3
 
-# by dotfloat
-# complaints go to dotfloat at gmail dot com
+"""
+steam_appmanifest.py
+Generates Steam app manifests, now with:
+1) A freely resizable GUI.
+2) A toggleable list of owned games.
+3) A search box to filter games by name in real time.
+"""
 
-# Running:
-# You need to have 'python3' and 'python3-gi' installed.
-#
-# On Debian/Ubuntu and derivatives, you have to run this:
-# $ sudo apt-get install python3 python3-gi
-#
-# On ArchLinux and derivatives:
-# $ sudo pacman -S python python-gobject
-#
-
-from gi.repository import Gtk
-from xml.etree.ElementTree import ElementTree
-from urllib.request import urlopen
-from os import path, listdir, remove, system, popen
-from os.path import isfile, join
+import os
+import sys
 import re
+import requests
+import xml.etree.ElementTree as ET
 
-# Change this to where your SteamApps folder is located.
-# The default ('~/.steam/steam/SteamApps') should be valid for all Linux installations.
-# "~/.steam/steam" is a symlink to "$XDG_DATA_HOME/Steam" (normally "~/.local/share/Steam")
-SteamApps = path.expanduser('~/.steam/steam/steamapps')
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk
 
-class DlgToggleApp(Gtk.Dialog):
+STEAM_MANIFEST_TEMPLATE = """\
+"AppState"
+{{
+    "AppID"        "{app_id}"
+    "Universe"      "1"
+    "name"          "{app_name}"
+    "StateFlags"    "4"
+    "installdir"    "{app_name}"
+    "LastUpdated"   "0"
+    "UpdateResult"  "0"
+    "SizeOnDisk"    "0"
+    "buildid"       "0"
+    "LastOwner"     "0"
+    "BytesToDownload"   "0"
+    "BytesDownloaded"   "0"
+    "BytesToStage"      "0"
+    "BytesStaged"       "0"
+}}
+"""
 
-    def __init__(self, parent, exists, appid, name):
-        Gtk.Dialog.__init__(self, "Install appmanifest", parent, 0)
-        self.set_default_size(300, 100)
-
-        label0 = Gtk.Label("Install \""+ name +"\"?")
-        label1 = Gtk.Label("appmanifest_"+ str(appid) +".acf")
-
-        if exists:
-            self.set_title("appmanifest already exists")
-            self.add_buttons( "Cancel", Gtk.ResponseType.CANCEL,
-                              "Delete anyway", Gtk.ResponseType.OK )
-            label0.set_text("This will just remove the appmanifest file")
-            label1.set_text("Use Steam to remove all of \""+ name +"\".")
-        else:
-            self.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
-                             "Install", Gtk.ResponseType.OK,)
-
-        self.get_content_area().add(label0)
-        self.get_content_area().add(label1)
-        self.show_all()
-
-class DlgManual(Gtk.Dialog):
-
-    def __init__(self, parent):
-        Gtk.Dialog.__init__(self, "Manually install appmanifest", parent, 0,
-                           ("Cancel", Gtk.ResponseType.CANCEL,
-                            "Install", Gtk.ResponseType.OK))
-
-        self.set_default_size(200, 50)
-
-        appidlabel = Gtk.Label("Game AppID:")
-        self.appidentry = Gtk.Entry()
-
-        appidhbox = Gtk.HBox()
-        appidhbox.pack_start(appidlabel, False, False, True)
-        appidhbox.pack_start(self.appidentry, False, False, True)
-
-        instdirlabel = Gtk.Label("Game directory name:")
-        self.instdirentry = Gtk.Entry()
-
-        instdirhbox = Gtk.HBox()
-        instdirhbox.pack_start(instdirlabel, False, False, True)
-        instdirhbox.pack_start(self.instdirentry, False, False, True)
-
-        vbox = Gtk.VBox()
-        vbox.pack_start(appidhbox, False, False, True)
-        vbox.pack_start(instdirhbox, False, False, True)
-
-        self.get_content_area().add(vbox)
-        self.show_all()
-
-class AppManifest(Gtk.Window):
+class SteamAppManifest(Gtk.Window):
     def __init__(self):
-        Gtk.Window.__init__(self, title="appmanifest.acf Generator")
+        super().__init__(title="Steam App Manifest")
+        self.set_border_width(10)
+        self.set_resizable(True)
+        self.set_default_size(600, 400)
 
-        self.set_default_size(480, 300)
+        # We'll store (toggled, app_id, name) in a ListStore for the TreeView
+        self.games_store = Gtk.ListStore(bool, str, str)
 
-        if not path.exists(SteamApps):
-            dialog = Gtk.MessageDialog(self, 0, Gtk.MessageType.ERROR,
-                                       Gtk.ButtonsType.OK, "Couldn't find a Steam install")
-            dialog.format_secondary_text('Looked in "'+ SteamApps +'"')
-            dialog.run()
-            dialog.destroy()
-            exit()
+        # Create a filter model from the main store
+        self.search_text = ""
+        self.filtered_store = self.games_store.filter_new()
+        self.filtered_store.set_visible_func(self.game_filter)
 
-        # first row
-        row0_label = Gtk.Label("https://steamcommunity.com/id/")
-        self.steamid = Gtk.Entry()
-        row0_btn = Gtk.Button("Refresh")
+        # Main Vertical Box
+        main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.add(main_vbox)
 
-        row0_btn.connect("clicked", self.onRefreshClick)
+        # Row0: Steam Profile ID entry and Refresh button
+        row0_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        main_vbox.pack_start(row0_box, False, False, 0)
 
-        row0 = Gtk.Box(spacing=6)
-        row0.pack_start(row0_label, True, True, 0)
-        row0.pack_start(self.steamid, True, True, 0)
-        row0.pack_start(row0_btn, True, True, 0)
+        row0_label = Gtk.Label(label="https://steamcommunity.com/id/")
+        self.profile_entry = Gtk.Entry()
+        row0_btn_refresh = Gtk.Button(label="Refresh")
+        row0_btn_refresh.connect("clicked", self.on_refresh_click)
 
-        # second row
-        row1 = Gtk.Label("Restart Steam for the changes to take effect.")
+        row0_box.pack_start(row0_label, False, False, 0)
+        row0_box.pack_start(self.profile_entry, True, True, 0)
+        row0_box.pack_start(row0_btn_refresh, False, False, 0)
 
-        # third row
-        self.game_liststore = Gtk.ListStore(bool, int, str)
+        # Row1: Instruction label
+        row1_label = Gtk.Label(label="Restart Steam for the changes to take effect.")
+        main_vbox.pack_start(row1_label, False, False, 0)
 
-        row2_treeview = Gtk.TreeView(model=self.game_liststore)
+        # Row2: Steam Library Path
+        row2_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        main_vbox.pack_start(row2_box, False, False, 0)
 
-        row2_renderer_text = Gtk.CellRendererText()
-        row2_renderer_check = Gtk.CellRendererToggle()
+        row2_label = Gtk.Label(label="Steam Library Path:")
+        self.library_entry = Gtk.Entry()
+        self.library_entry.set_text(self.get_default_steam_path())
+        row2_box.pack_start(row2_label, False, False, 0)
+        row2_box.pack_start(self.library_entry, True, True, 0)
 
-        row2_col_toggle = Gtk.TreeViewColumn("", row2_renderer_check, active=0)
-        row2_col_appid = Gtk.TreeViewColumn("AppID", row2_renderer_text, text=1)
-        row2_col_title = Gtk.TreeViewColumn("Title", row2_renderer_text, text=2)
+        # Row3: Search box
+        row3_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        main_vbox.pack_start(row3_box, False, False, 0)
 
-        row2_renderer_check.connect("toggled", self.onAppToggle)
+        row3_label = Gtk.Label(label="Search games:")
+        self.search_entry = Gtk.Entry()
+        self.search_entry.connect("changed", self.on_search_changed)
 
-        row2_treeview.append_column( row2_col_toggle )
-        row2_treeview.append_column( row2_col_appid )
-        row2_treeview.append_column( row2_col_title )
+        row3_box.pack_start(row3_label, False, False, 0)
+        row3_box.pack_start(self.search_entry, True, True, 0)
 
-        row2 = Gtk.ScrolledWindow()
-        row2.set_size_request(200, 400)
-        row2.add(row2_treeview)
+        # Row4: Scrolled Window containing a TreeView of toggles and game names
+        scrolled_win = Gtk.ScrolledWindow()
+        scrolled_win.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        main_vbox.pack_start(scrolled_win, True, True, 0)
 
-        # fourth row
-        row3_manual = Gtk.Button("Manual")
-        row3_quit = Gtk.Button("Quit")
+        self.treeview = Gtk.TreeView(model=self.filtered_store)
+        # Create a toggle renderer
+        renderer_toggle = Gtk.CellRendererToggle()
+        renderer_toggle.connect("toggled", self.on_toggle_toggled)
 
-        row3_manual.connect("clicked", self.onManualClick)
-        row3_quit.connect("clicked", self.onQuitClick)
+        col_toggle = Gtk.TreeViewColumn("Select", renderer_toggle, active=0)
+        self.treeview.append_column(col_toggle)
 
-        row3 = Gtk.Box()
-        row3.pack_start(row3_manual, True, True, 0)
-        row3.pack_start(row3_quit, True, True, 0)
+        # We'll hide the app_id in the UI, but store it in the model at column 1
+        renderer_text = Gtk.CellRendererText()
+        col_name = Gtk.TreeViewColumn("Game Name", renderer_text, text=2)
+        self.treeview.append_column(col_name)
 
-        # vbox
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        scrolled_win.add(self.treeview)
 
-        vbox.pack_start(row0, False, False, True)
-        vbox.pack_start(row1, False, False, 0)
-        vbox.pack_start(row2, True, True, 0)
-        vbox.pack_start(row3, False, False, 0)
+        # Row5: Manual, Download, and Quit buttons
+        row5_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        main_vbox.pack_start(row5_box, False, False, 0)
 
-        self.add(vbox)
+        row5_manual = Gtk.Button(label="Manual")
+        row5_manual.connect("clicked", self.on_manual_click)
 
-    # slots
-    def onRefreshClick(self, widget):
-        if not self.steamid.get_text():
+        row5_download = Gtk.Button(label="Download")
+        row5_download.connect("clicked", self.on_download_click)
+
+        row5_quit = Gtk.Button(label="Quit")
+        row5_quit.connect("clicked", Gtk.main_quit)
+
+        row5_box.pack_start(row5_manual, False, False, 0)
+        row5_box.pack_start(row5_download, False, False, 0)
+        row5_box.pack_start(row5_quit, False, False, 0)
+
+        self.connect("destroy", Gtk.main_quit)
+        self.show_all()
+
+    def get_default_steam_path(self):
+        """
+        Attempt to auto-detect the default Steam library path.
+        """
+        home = os.path.expanduser("~")
+        if sys.platform.startswith("win"):
+            # This is a naive guess, the user may have installed Steam elsewhere
+            return "C:\\Program Files (x86)\\Steam\\steamapps"
+        elif sys.platform.startswith("darwin"):
+            # macOS default
+            return os.path.join(home, "Library", "Application Support", "Steam", "steamapps")
+        else:
+            # Linux default
+            return os.path.join(home, ".local", "share", "Steam", "steamapps")
+
+    def on_refresh_click(self, button):
+        """
+        Called when the Refresh button is clicked.
+        Fetch the public Steam profile, parse for owned games, and populate the toggle list.
+        """
+        profile_id = self.profile_entry.get_text().strip()
+        if not profile_id:
+            self.show_message("Please enter a profile ID.")
             return
 
-        files = [ f for f in listdir(SteamApps) if isfile(join(SteamApps,f)) ]
-        appids = []
+        url = f"https://steamcommunity.com/id/{profile_id}/games?tab=all&xml=1"
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            self.show_message(f"Failed to fetch the profile: {e}")
+            return
 
-        for file in files:
-            m = re.search(r"appmanifest_([0-9]+).acf", file)
-            if m:
-                appids.append( int( m.groups(1)[0] ) )
+        # Clear the store each time Refresh is clicked, so we do not accumulate duplicates
+        self.games_store.clear()
 
-        url = "http://steamcommunity.com/id/"+ self.steamid.get_text() +"/games?tab=all&xml=1"
-        html = urlopen(url)
-        tree = ElementTree()
-        tree.parse(html)
-        games_xml = tree.getiterator('game')
+        try:
+            root = ET.fromstring(response.text)
+            games_xml = root.iter('game')
+        except ET.ParseError as e:
+            self.show_message(f"Failed to parse the XML: {e}")
+            return
+
         for game in games_xml:
-            appid = int(game.find('appID').text)
-            name = game.find('name').text
-            exists = appid in appids
-            self.game_liststore.append([exists, appid, name])
+            app_id = game.find('appID').text if game.find('appID') is not None else None
+            name = game.find('name').text if game.find('name') is not None else None
+            if app_id and name:
+                # Add the game to the ListStore with toggled=False by default
+                self.games_store.append([False, app_id, name])
 
-    def onAppToggle(self, widget, path):
-        appid = self.game_liststore[path][1]
-        name = self.game_liststore[path][2]
-        exists = self.refreshSingleRow(path)
+        # After refreshing, re-run the filter so the user sees the correct results
+        self.filtered_store.refilter()
 
-        dialog = DlgToggleApp(self, exists, appid, name)
-        response = dialog.run()
+    def on_search_changed(self, entry):
+        """
+        Callback triggered when the user types in the search box.
+        Updates the search string and refilters the list.
+        """
+        self.search_text = entry.get_text().strip().lower()
+        self.filtered_store.refilter()
 
-        if response == Gtk.ResponseType.OK:
-            p = SteamApps + "/appmanifest_"+ str(appid) +".acf"
-            if exists:
-                remove(p)
-            else:
-                self.addGame( appid, name )
+    def game_filter(self, store, iter_, data=None):
+        """
+        The visible_func for the filter. Shows rows where the game name matches the search text.
+        """
+        toggled, app_id, game_name = store[iter_]
+        # If no search text, show everything
+        if not self.search_text:
+            return True
+        # Otherwise, show if self.search_text is a substring of game_name (case-insensitive)
+        return self.search_text in game_name.lower()
+
+    def on_toggle_toggled(self, cell_renderer, path):
+        """
+        Toggle the checkbox in the TreeView (the underlying store is self.games_store).
+        """
+        # Convert path in filtered_store to an iter in the filtered model
+        filtered_iter = self.filtered_store.get_iter(path)
+        # Map this to the underlying store's iter
+        real_iter = self.filtered_store.convert_iter_to_child_iter(filtered_iter)
+        current_state = self.games_store[real_iter][0]
+        self.games_store[real_iter][0] = not current_state
+
+    def on_manual_click(self, button):
+        """
+        The Manual button could open a help page, or do something else.
+        """
+        self.show_message("Manual button clicked. Provide instructions here if needed.")
+
+    def on_download_click(self, button):
+        """
+        Creates manifests only for the toggled (True) games in the underlying store.
+        """
+        steam_path = self.library_entry.get_text()
+        if not os.path.isdir(steam_path):
+            self.show_message("Please provide a valid Steam library path.")
+            return
+
+        created_count = 0
+        for row in self.games_store:
+            toggled, app_id, game_name = row
+            if toggled:
+                manifest_content = STEAM_MANIFEST_TEMPLATE.format(app_id=app_id, app_name=game_name)
+                manifest_path = os.path.join(steam_path, f"appmanifest_{app_id}.acf")
+                try:
+                    with open(manifest_path, 'w', encoding='utf-8') as f:
+                        f.write(manifest_content)
+                    created_count += 1
+                except OSError as e:
+                    self.show_message(f"Error creating manifest for {game_name}: {e}")
+
+        self.show_message(f"Successfully created {created_count} manifest files.")
+
+    def show_message(self, message):
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text=message
+        )
+        dialog.run()
         dialog.destroy()
 
-        self.refreshSingleRow(path)
+def main():
+    app = SteamAppManifest()
+    Gtk.main()
 
-    def onManualClick(self, widget):
-        dialog = DlgManual(self)
-        response = dialog.run()
-
-        if response == Gtk.ResponseType.OK:
-            self.addGame( int(dialog.appidentry.get_text()), dialog.instdirentry.get_text() )
-
-        dialog.destroy()
-
-    def onQuitClick(self, widget):
-        self.destroy()
-        Gtk.main_quit()
-
-    # other
-    def refreshSingle(self, appid):
-        p = SteamApps + "/appmanifest_"+ str(appid) +".acf"
-        exists = path.isfile( p )
-
-        for row in self.game_liststore:
-            if row[1] == appid:
-                row[0] = exists
-                break
-
-        return exists
-
-    def refreshSingleRow(self, row):
-        p = SteamApps + "/appmanifest_"+ str(self.game_liststore[row][1]) +".acf"
-        exists = path.isfile( p )
-
-        self.game_liststore    [row][0] = exists
-
-        return exists
-
-    def addGame(self, appid, name):
-        p = SteamApps + "/appmanifest_"+ str(appid) +".acf"
-        f = open(p, 'w')
-        name = name.replace("/", "-")
-        f.write( '"AppState"\n{\n\t"appid"\t"'+ str(appid) +'"\n\t"Universe"'+
-                 '\t"1"\n\t"installdir"\t"'+ name +'"\n\t"StateFlags"\t"1026"\n}')
-        f.close()
-
-win = AppManifest()
-win.connect("delete-event", Gtk.main_quit)
-win.show_all()
-Gtk.main()
+if __name__ == "__main__":
+    main()
